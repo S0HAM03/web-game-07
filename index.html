@@ -1,0 +1,782 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<title>Echo Runner — Dodge Your Own Past</title>
+<meta name="description" content="A circular track runner where ghosts of your past movements become deadly obstacles. Can you outrun yourself?">
+<meta name="keywords" content="echo runner, circular runner, ghost, arcade, endless runner, CrazyGames, casual">
+<meta name="theme-color" content="#060B14">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<script src="https://sdk.crazygames.com/crazygames-sdk-v3.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    width: 100%; height: 100%;
+    background: #020508;
+    display: flex; align-items: center; justify-content: center;
+    overflow: hidden; touch-action: none;
+  }
+  #game canvas { display: block; }
+</style>
+</head>
+<body>
+<div id="game"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/phaser@3.88.2/dist/phaser.min.js"></script>
+<script>
+'use strict';
+
+// ════════════════════════════════════════════════════════════
+//  CONSTANTS
+// ════════════════════════════════════════════════════════════
+const GW = 960, GH = 540;
+const TR   = 500;               // track radius (px)
+const CX   = GW / 2;           // circle centre X = 480
+const CY   = GH + TR - 200;    // circle centre Y = 840 (below screen)
+const TSY  = CY - TR;          // track surface Y = 340
+
+const PR         = 11;    // player radius (px)
+const BASE_SPD   = 0.28;  // starting angular speed (rad/sec)
+const SPEED_RAMP = 0.004; // speed added per second (rad/sec)
+const MAX_SPD    = 1.4;   // cap
+const JMP_VEL    = 420;   // launch velocity (px/sec)
+const GRV        = 940;   // gravity (px/sec²)
+const GHOST_INT  = 5000;  // ms between ghost placements
+const COL_A      = 0.037; // collision half-arc (rad ≈ 2.1°)
+const TRAIL_LEN  = 30;
+
+// Static obstacles: [angle (rad 0-2π), height (px), half-width (px)]
+const OBS = [
+  [0.52, 56, 10], [1.28, 68,  8], [2.06, 50, 11],
+  [2.84, 74,  9], [3.62, 58, 10], [4.30, 62,  8],
+  [5.10, 48, 11], [5.88, 66,  9],
+];
+
+// Palette
+const C = {
+  BG:    0x060B14,  PLANET: 0x091E2E,
+  SURF:  0x00FFD1,  SURF2:  0x40EEB8,
+  PL:    0xFFE066,  PLCORE: 0xFFFFFF,
+  TRAIL: 0xFFAA22,
+  OB:    0x180009,  OBE:    0xFF2244,
+  GH:    0x00CCFF,
+};
+
+// ════════════════════════════════════════════════════════════
+//  CRAZYGAMES SDK WRAPPER
+// ════════════════════════════════════════════════════════════
+const CG = {
+  async init()  { try { await window.CrazyGames?.SDK?.init(); } catch(e) {} },
+  loadStart()   { try { CrazyGames.SDK.game.sdkGameLoadingStart(); } catch(e) {} },
+  loadStop()    { try { CrazyGames.SDK.game.sdkGameLoadingStop();  } catch(e) {} },
+  gpStart()     { try { CrazyGames.SDK.game.gameplayStart();       } catch(e) {} },
+  gpStop()      { try { CrazyGames.SDK.game.gameplayStop();        } catch(e) {} },
+  async midAd() {
+    return new Promise(res => {
+      try {
+        CrazyGames.SDK.ad.requestAd('midgame', {
+          adFinished: res, adError: res, adStarted: () => {},
+        });
+      } catch(e) { res(); }
+    });
+  },
+};
+
+// ════════════════════════════════════════════════════════════
+//  WEB AUDIO ENGINE
+// ════════════════════════════════════════════════════════════
+const SFX = {
+  _ctx: null, bgGain: null, muted: true,
+
+  ctx() {
+    if (!this._ctx) this._ctx = new (window.AudioContext || window.webkitAudioContext)();
+    return this._ctx;
+  },
+  resume() { if (!this.muted) this.ctx().resume(); },
+  setMuted(m) {
+    this.muted = m;
+    if (this.bgGain) this.bgGain.gain.setTargetAtTime(m ? 0 : 0.11, this.ctx().currentTime, 0.4);
+    if (!m) this.ctx().resume();
+  },
+
+  startBGM() {
+    const c = this.ctx();
+    if (this.bgGain) return;
+    this.bgGain = c.createGain();
+    this.bgGain.gain.value = this.muted ? 0 : 0.11;
+    // Three-voice ambient drone
+    [55, 82.41, 110].forEach((f, i) => {
+      const o  = c.createOscillator(); o.type = i === 0 ? 'triangle' : 'sine'; o.frequency.value = f;
+      const lfo = c.createOscillator(); lfo.type = 'sine'; lfo.frequency.value = 0.07 + i * 0.04;
+      const lg  = c.createGain(); lg.gain.value = 0.45; lfo.connect(lg.gain);
+      const og  = c.createGain(); og.gain.value = 0.35; lg.connect(og.gain);
+      const flt = c.createBiquadFilter(); flt.type = 'lowpass'; flt.frequency.value = 280 + i * 90;
+      o.connect(og); og.connect(flt); flt.connect(this.bgGain);
+      o.start(); lfo.start();
+    });
+    this.bgGain.connect(c.destination);
+  },
+
+  _play(fn) {
+    if (this.muted) return;
+    try { const c = this.ctx(); c.resume(); fn(c, c.currentTime); } catch(e) {}
+  },
+
+  jump() {
+    this._play((c, t) => {
+      const o = c.createOscillator(); o.type = 'sine';
+      o.frequency.setValueAtTime(360, t);
+      o.frequency.exponentialRampToValueAtTime(840, t + 0.1);
+      const g = c.createGain(); g.gain.setValueAtTime(0.08, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.14);
+      o.connect(g); g.connect(c.destination); o.start(t); o.stop(t + 0.14);
+    });
+  },
+
+  land() {
+    this._play((c, t) => {
+      const o = c.createOscillator(); o.type = 'triangle';
+      o.frequency.setValueAtTime(210, t); o.frequency.exponentialRampToValueAtTime(55, t + 0.07);
+      const g = c.createGain(); g.gain.setValueAtTime(0.06, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.09);
+      o.connect(g); g.connect(c.destination); o.start(t); o.stop(t + 0.09);
+    });
+  },
+
+  ghostDeploy() {
+    this._play((c, t) => {
+      [200, 280, 380].forEach((f, i) => {
+        const o = c.createOscillator(); o.type = 'sine'; o.frequency.value = f;
+        const g = c.createGain();
+        const d = t + i * 0.06;
+        g.gain.setValueAtTime(0, d); g.gain.linearRampToValueAtTime(0.055, d + 0.03);
+        g.gain.exponentialRampToValueAtTime(0.001, d + 0.32);
+        o.connect(g); g.connect(c.destination); o.start(d); o.stop(d + 0.32);
+      });
+    });
+  },
+
+  death() {
+    this._play((c, t) => {
+      const o = c.createOscillator(); o.type = 'triangle';
+      o.frequency.setValueAtTime(110, t); o.frequency.exponentialRampToValueAtTime(10, t + 0.55);
+      const g = c.createGain(); g.gain.setValueAtTime(0.40, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.55);
+      const buf = c.createBuffer(1, c.sampleRate * 0.35, c.sampleRate);
+      const d = buf.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+      const ns = c.createBufferSource(); ns.buffer = buf;
+      const nf = c.createBiquadFilter(); nf.type = 'highpass'; nf.frequency.value = 900;
+      const ng = c.createGain(); ng.gain.setValueAtTime(0.14, t); ng.gain.exponentialRampToValueAtTime(0.001, t + 0.35);
+      o.connect(g); g.connect(c.destination);
+      ns.connect(nf); nf.connect(ng); ng.connect(c.destination);
+      o.start(t); o.stop(t + 0.55); ns.start(t); ns.stop(t + 0.35);
+    });
+  },
+
+  milestone() {
+    this._play((c, t) => {
+      [523, 659, 784].forEach((f, i) => {
+        const o = c.createOscillator(); o.type = 'sine'; o.frequency.value = f;
+        const g = c.createGain();
+        g.gain.setValueAtTime(0.065, t + i * 0.09); g.gain.exponentialRampToValueAtTime(0.001, t + i * 0.09 + 0.38);
+        o.connect(g); g.connect(c.destination); o.start(t + i * 0.09); o.stop(t + i * 0.09 + 0.38);
+      });
+    });
+  },
+};
+
+// ════════════════════════════════════════════════════════════
+//  MATH HELPERS
+// ════════════════════════════════════════════════════════════
+function makeStars(n) {
+  return Array.from({ length: n }, () => ({
+    x:  Phaser.Math.FloatBetween(0, GW),
+    y:  Phaser.Math.FloatBetween(0, TSY + 15),
+    r:  Phaser.Math.FloatBetween(0.5, 2.4),
+    a:  Phaser.Math.FloatBetween(0.3, 1.0),
+    tw: Phaser.Math.FloatBetween(0.5, 3.0),
+    to: Phaser.Math.FloatBetween(0, Math.PI * 2),
+  }));
+}
+
+// Returns how far (rad) an obstacle is from player.
+// Positive = ahead, Negative = behind. 0 = at player.
+function obsRel(obsAngle, worldAngle) {
+  let r = (obsAngle - worldAngle + Math.PI / 2) % (Math.PI * 2);
+  if (r > Math.PI)  r -= Math.PI * 2;
+  return r;
+}
+
+// Ghost: stored as worldAngle at deployment time (gWA).
+// Ghost's rel angle = gWA - worldAngle (positive when ahead, near 0 = collision).
+function ghostRel(gWA, worldAngle) {
+  let r = (gWA - worldAngle) % (Math.PI * 2);
+  if (r >  Math.PI) r -= Math.PI * 2;
+  if (r < -Math.PI) r += Math.PI * 2;
+  return r;
+}
+
+// ════════════════════════════════════════════════════════════
+//  SHARED DRAW HELPERS
+// ════════════════════════════════════════════════════════════
+function drawBackground(g, stars, time) {
+  g.fillStyle(C.BG, 1);
+  g.fillRect(0, 0, GW, GH);
+  stars.forEach(s => {
+    const a = s.a * (0.55 + 0.45 * Math.sin(time * 0.001 * s.tw + s.to));
+    g.fillStyle(0xBBDDFF, a);
+    g.fillCircle(s.x, s.y, s.r);
+  });
+}
+
+function drawTrack(g) {
+  // Planet body
+  g.fillStyle(C.PLANET, 1);
+  g.fillCircle(CX, CY, TR + 10);
+  // Atmospheric glow — layered
+  g.lineStyle(32, C.SURF, 0.035); g.strokeCircle(CX, CY, TR + 22);
+  g.lineStyle(16, C.SURF, 0.09);  g.strokeCircle(CX, CY, TR + 11);
+  g.lineStyle(7,  C.SURF, 0.20);  g.strokeCircle(CX, CY, TR +  4);
+  // Main surface
+  g.lineStyle(2.5, C.SURF, 0.90); g.strokeCircle(CX, CY, TR);
+  // Inner track markings
+  g.lineStyle(1.2, C.SURF2, 0.30); g.strokeCircle(CX, CY, TR -  5);
+  g.lineStyle(0.6, C.SURF2, 0.14); g.strokeCircle(CX, CY, TR - 13);
+}
+
+function drawSpike(g, angle, worldAngle, h, hw, dangerFrac) {
+  const sa = angle - worldAngle;
+  const ox = CX + TR * Math.cos(sa);
+  const oy = CY + TR * Math.sin(sa);
+  if (oy < TSY - h - 40 || oy > GH + 20) return;
+
+  const nx = (ox - CX) / TR, ny = (oy - CY) / TR; // outward normal
+  const px = -ny,  py = nx;                          // tangent (perpendicular)
+  const tipX = ox - nx * h,  tipY = oy - ny * h;
+  const x1 = ox + px * hw,   y1 = oy + py * hw;
+  const x2 = ox - px * hw,   y2 = oy - py * hw;
+
+  // Outer glow (intensifies near player)
+  const ga = 0.10 + dangerFrac * 0.55;
+  g.lineStyle(20, C.OBE, ga * 0.35); g.strokeTriangle(x1,y1, x2,y2, tipX,tipY);
+  g.lineStyle( 8, C.OBE, ga * 0.70); g.strokeTriangle(x1,y1, x2,y2, tipX,tipY);
+  // Body fill
+  g.fillStyle(C.OB, 1);               g.fillTriangle(x1,y1, x2,y2, tipX,tipY);
+  // Sharp edge
+  g.lineStyle(1.5, C.OBE, 0.95);      g.strokeTriangle(x1,y1, x2,y2, tipX,tipY);
+  // Tip glint
+  g.fillStyle(C.OBE, 0.75);           g.fillCircle(tipX, tipY, 2.8);
+}
+
+// ════════════════════════════════════════════════════════════
+//  BOOT SCENE
+// ════════════════════════════════════════════════════════════
+class BootScene extends Phaser.Scene {
+  constructor() { super('Boot'); }
+  async create() {
+    CG.loadStart();
+    const mono = { fontFamily: '"Space Mono", monospace' };
+
+    this.add.text(GW/2, GH/2 - 28, 'ECHO RUNNER', {
+      ...mono, fontSize: '32px', fontStyle: 'bold', color: '#00FFD1', letterSpacing: 8,
+    }).setOrigin(0.5);
+
+    const dot = this.add.text(GW/2, GH/2 + 20, '● ● ●', {
+      ...mono, fontSize: '14px', color: '#1A5A4A', letterSpacing: 14,
+    }).setOrigin(0.5);
+    this.tweens.add({ targets: dot, alpha: 0.2, duration: 480, yoyo: true, repeat: -1 });
+
+    await CG.init();
+    await new Promise(r => setTimeout(r, 1000));
+    CG.loadStop();
+    this.scene.start('Menu');
+  }
+}
+
+// ════════════════════════════════════════════════════════════
+//  MENU SCENE
+// ════════════════════════════════════════════════════════════
+class MenuScene extends Phaser.Scene {
+  constructor() { super('Menu'); }
+
+  create() {
+    this.g      = this.add.graphics();
+    this.stars  = makeStars(200);
+    this.dAngle = 0;
+    this._starting = false;
+    const mono = { fontFamily: '"Space Mono", monospace' };
+    const best = parseInt(localStorage.getItem('er_best') || 0);
+
+    // Title (fade-in)
+    const title = this.add.text(GW/2, GH/2 - 138, 'ECHO RUNNER', {
+      ...mono, fontSize: '56px', fontStyle: 'bold', color: '#00FFD1', letterSpacing: 4,
+    }).setOrigin(0.5).setAlpha(0);
+    this.tweens.add({ targets: title, alpha: 1, duration: 900, ease: 'Sine.easeOut' });
+
+    this.add.text(GW/2, GH/2 - 84, 'dodge your own past', {
+      ...mono, fontSize: '14px', color: '#2A8870', letterSpacing: 3,
+    }).setOrigin(0.5);
+
+    if (best > 0) {
+      this.add.text(GW/2, GH/2 - 52, `BEST  ${best}`, {
+        ...mono, fontSize: '18px', color: '#FFE066',
+      }).setOrigin(0.5);
+    }
+
+    // Tap to play (blinking)
+    const tap = this.add.text(GW/2, GH/2 + 8, '[ TAP  /  SPACE ]', {
+      ...mono, fontSize: '20px', color: '#FFFFFF', letterSpacing: 3,
+    }).setOrigin(0.5).setInteractive({ cursor: 'pointer' });
+    tap.on('pointerup', () => this.startGame());
+    this.tweens.add({ targets: tap, alpha: 0.2, duration: 660, yoyo: true, repeat: -1, ease: 'Sine.easeInOut' });
+
+    // Instructions
+    const infoStyle = { ...mono, fontSize: '11px', color: '#1E4A5A' };
+    this.add.text(GW/2, GH/2 + 62, 'SPACE or TAP anywhere to jump over obstacles', infoStyle).setOrigin(0.5);
+    this.add.text(GW/2, GH/2 + 79, 'every 5 seconds a ghost of YOU appears on the track', infoStyle).setOrigin(0.5);
+    this.add.text(GW/2, GH/2 + 96, 'dodge it or be destroyed by your own past', { ...infoStyle, color: '#1A3A48' }).setOrigin(0.5);
+
+    // Sound toggle
+    const sndBtn = this.add.text(GW - 22, 22, SFX.muted ? '🔇' : '🔊', { fontSize: '22px' })
+      .setOrigin(1, 0).setInteractive({ cursor: 'pointer' }).setDepth(10);
+    sndBtn.on('pointerup', () => {
+      SFX.muted = !SFX.muted;
+      sndBtn.setText(SFX.muted ? '🔇' : '🔊');
+      SFX.setMuted(SFX.muted);
+      if (!SFX.muted) SFX.startBGM();
+    });
+
+    // Keyboard input
+    this.input.keyboard.on('keyup-SPACE', () => this.startGame());
+    this.input.keyboard.on('keyup-ENTER', () => this.startGame());
+  }
+
+  startGame() {
+    if (this._starting) return;
+    this._starting = true;
+    if (!SFX.muted) { SFX.resume(); SFX.startBGM(); }
+    this.scene.start('Game');
+  }
+
+  update(time, delta) {
+    this.dAngle += 0.009 * (delta / 16.7);
+    const g = this.g; g.clear();
+    drawBackground(g, this.stars, time);
+    drawTrack(g);
+    OBS.slice(0, 5).forEach(([a, h, hw]) => drawSpike(g, a, this.dAngle, h, hw, 0));
+    // Demo player orb
+    const dpx = CX, dpy = TSY - PR;
+    g.fillStyle(C.PL, 0.08); g.fillCircle(dpx, dpy, PR + 16);
+    g.fillStyle(C.PL, 0.18); g.fillCircle(dpx, dpy, PR + 8);
+    g.fillStyle(C.PL, 1);    g.fillCircle(dpx, dpy, PR);
+    g.fillStyle(C.PLCORE, 0.6); g.fillCircle(dpx - 3, dpy - 3, PR * 0.4);
+  }
+}
+
+// ════════════════════════════════════════════════════════════
+//  GAME SCENE
+// ════════════════════════════════════════════════════════════
+class GameScene extends Phaser.Scene {
+  constructor() { super('Game'); }
+
+  create() {
+    // ── State ──────────────────────────────────
+    this.worldAngle = 0;
+    this.speed      = BASE_SPD;
+    this.score      = 0;
+    this.alive      = true;
+
+    // ── Jump ───────────────────────────────────
+    this.jVel    = 0;
+    this.jOff    = 0;    // pixels above track surface
+    this.canJump = true;
+
+    // ── Ghost system ───────────────────────────
+    this.ghosts          = [];        // worldAngle values at each ghost deployment
+    this.ghostTimer      = GHOST_INT;
+    this.showingDeployed = false;
+    this.showCountdown   = false;
+
+    // ── Trail ──────────────────────────────────
+    this.trail = [];
+
+    // ── Milestones ─────────────────────────────
+    this.lastMilestone = 0;
+
+    // ── Stars ──────────────────────────────────
+    this.stars = makeStars(200);
+
+    // ── Graphics layers (depth-ordered) ────────
+    this.gBG    = this.add.graphics().setDepth(0);  // bg + stars
+    this.gTrack = this.add.graphics().setDepth(1);  // planet + surface
+    this.gGhost = this.add.graphics().setDepth(2);  // ghost orbs
+    this.gObs   = this.add.graphics().setDepth(3);  // obstacle spikes
+    this.gPl    = this.add.graphics().setDepth(4);  // player + trail
+    this.gOver  = this.add.graphics().setDepth(5);  // screen flash / death overlay
+
+    // ── Ghost timer bar ────────────────────────
+    this.gBar = this.add.graphics().setDepth(9);
+
+    // ── HUD text ───────────────────────────────
+    const mono = { fontFamily: '"Space Mono", monospace' };
+
+    this.scoreTxt = this.add.text(GW/2, 22, '0', {
+      ...mono, fontSize: '40px', fontStyle: 'bold', color: '#FFFFFF',
+    }).setOrigin(0.5, 0).setDepth(10);
+
+    this.add.text(GW/2, 66, 'DISTANCE', {
+      ...mono, fontSize: '10px', color: '#1E4A5A', letterSpacing: 4,
+    }).setOrigin(0.5, 0).setDepth(10);
+
+    this.lapTxt = this.add.text(22, 22, 'LAP  1', {
+      ...mono, fontSize: '13px', color: '#2A7A6A',
+    }).setOrigin(0, 0).setDepth(10);
+
+    this.spdTxt = this.add.text(GW - 22, 22, 'SPEED ×1.0', {
+      ...mono, fontSize: '12px', color: '#1E4A5A',
+    }).setOrigin(1, 0).setDepth(10);
+
+    this.ghostWarnTxt = this.add.text(GW/2, TSY - 58, '', {
+      ...mono, fontSize: '17px', color: '#00CCFF', letterSpacing: 4,
+    }).setOrigin(0.5).setDepth(10).setAlpha(0);
+
+    // Sound toggle
+    const sndBtn = this.add.text(GW - 22, 55, SFX.muted ? '🔇' : '🔊', { fontSize: '20px' })
+      .setOrigin(1, 0).setInteractive({ cursor: 'pointer' }).setDepth(10);
+    sndBtn.on('pointerup', () => {
+      SFX.muted = !SFX.muted;
+      sndBtn.setText(SFX.muted ? '🔇' : '🔊');
+      SFX.setMuted(SFX.muted);
+    });
+
+    // ── Input ──────────────────────────────────
+    this.keys = this.input.keyboard.addKeys({
+      space: Phaser.Input.Keyboard.KeyCodes.SPACE,
+      up:    Phaser.Input.Keyboard.KeyCodes.UP,
+      w:     Phaser.Input.Keyboard.KeyCodes.W,
+    });
+    // Tap: only jump if pointer is below HUD area
+    this.input.on('pointerdown', ptr => { if (ptr.y > 90) this.doJump(); });
+
+    CG.gpStart();
+    if (!SFX.muted) { SFX.resume(); SFX.startBGM(); }
+  }
+
+  doJump() {
+    if (!this.alive || !this.canJump) return;
+    this.jVel    = -JMP_VEL;
+    this.jOff    = 1;
+    this.canJump = false;
+    SFX.jump();
+  }
+
+  update(time, delta) {
+    const dt = delta / 1000;
+
+    // Keyboard jump
+    if (Phaser.Input.Keyboard.JustDown(this.keys.space) ||
+        Phaser.Input.Keyboard.JustDown(this.keys.up) ||
+        Phaser.Input.Keyboard.JustDown(this.keys.w)) this.doJump();
+
+    if (this.alive) {
+      // ── Speed & rotation ─────────────────────
+      this.speed = Math.min(BASE_SPD + (time / 1000) * SPEED_RAMP, MAX_SPD);
+      this.worldAngle += this.speed * dt;
+      this.spdTxt.setText(`SPEED ×${(this.speed / BASE_SPD).toFixed(1)}`);
+
+      // ── Score ────────────────────────────────
+      this.score = Math.round(this.worldAngle * TR / 8);
+      this.scoreTxt.setText(this.score.toString());
+
+      // ── Lap ──────────────────────────────────
+      this.lapTxt.setText(`LAP  ${Math.floor(this.worldAngle / (Math.PI * 2)) + 1}`);
+
+      // ── Jump physics ─────────────────────────
+      if (this.jOff > 0 || this.jVel < 0) {
+        this.jVel += GRV * dt;
+        this.jOff -= this.jVel * dt;
+        if (this.jOff <= 0) {
+          this.jOff = 0; this.jVel = 0;
+          if (!this.canJump) { this.canJump = true; SFX.land(); }
+        }
+      }
+
+      // ── Ghost timer ──────────────────────────
+      this.ghostTimer -= delta;
+      const countdown = Math.ceil(this.ghostTimer / 1000);
+
+      if (this.ghostTimer <= 0) {
+        this.ghosts.push(this.worldAngle);
+        this.ghostTimer = GHOST_INT;
+        SFX.ghostDeploy();
+        this.showingDeployed = true;
+        this.showCountdown   = false;
+        this.time.delayedCall(1300, () => { this.showingDeployed = false; });
+      } else if (!this.showingDeployed && countdown <= 3) {
+        this.showCountdown = true;
+      } else if (!this.showingDeployed && countdown > 3) {
+        this.showCountdown = false;
+      }
+
+      // Warning text
+      if (this.showingDeployed) {
+        this.ghostWarnTxt.setText('— GHOST DEPLOYED —').setAlpha(0.95);
+      } else if (this.showCountdown) {
+        const pulse = 0.55 + 0.45 * Math.sin(time * 0.012);
+        this.ghostWarnTxt.setText(`GHOST IN  ${countdown}`).setAlpha(pulse);
+      } else {
+        this.ghostWarnTxt.setAlpha(0);
+      }
+
+      // ── Ghost timer bar ───────────────────────
+      this.drawGhostBar(this.ghostTimer / GHOST_INT);
+
+      // ── Milestone ────────────────────────────
+      const ms = Math.floor(this.score / 200);
+      if (ms > this.lastMilestone) {
+        this.lastMilestone = ms;
+        SFX.milestone();
+        this.spawnFloatingScore(this.score);
+      }
+
+      // ── Collision ────────────────────────────
+      this.checkCollisions();
+    }
+
+    // ── Trail ──────────────────────────────────
+    this.trail.push({ x: CX, y: TSY - PR - this.jOff });
+    if (this.trail.length > TRAIL_LEN) this.trail.shift();
+
+    // ── Render ───────────────────────────────
+    this.renderAll(time);
+  }
+
+  drawGhostBar(frac) {
+    const g = this.gBar; g.clear();
+    const bW = 200, bH = 4, bX = (GW - bW) / 2, bY = 84;
+    g.fillStyle(0x0A1820, 0.85); g.fillRoundedRect(bX, bY, bW, bH, 2);
+    const col = frac > 0.5 ? 0x00CCFF : frac > 0.25 ? 0x00AAAA : 0xFF5533;
+    g.fillStyle(col, 0.9);
+    if (frac > 0.001) g.fillRoundedRect(bX, bY, bW * frac, bH, 2);
+  }
+
+  spawnFloatingScore(score) {
+    const t = this.add.text(GW/2, TSY - 80, `${score}`, {
+      fontFamily: '"Space Mono", monospace', fontSize: '24px', color: '#FFE066',
+    }).setOrigin(0.5).setDepth(20);
+    this.tweens.add({
+      targets: t, alpha: 0, y: TSY - 135, duration: 1100, ease: 'Expo.Out',
+      onComplete: () => t.destroy(),
+    });
+  }
+
+  checkCollisions() {
+    // vs static obstacles
+    for (const [a, h] of OBS) {
+      if (Math.abs(obsRel(a, this.worldAngle)) < COL_A && this.jOff < h + PR) {
+        this.die(); return;
+      }
+    }
+    // vs ghost orbs
+    for (const gWA of this.ghosts) {
+      if (Math.abs(ghostRel(gWA, this.worldAngle)) < COL_A && this.jOff < PR * 2.5) {
+        this.die(); return;
+      }
+    }
+  }
+
+  die() {
+    if (!this.alive) return;
+    this.alive = false;
+    SFX.death();
+    CG.gpStop();
+    this.cameras.main.shake(550, 0.018);
+
+    const best = parseInt(localStorage.getItem('er_best') || 0);
+    if (this.score > best) localStorage.setItem('er_best', String(this.score));
+
+    this.time.delayedCall(1400, async () => {
+      await CG.midAd();
+      this.scene.start('Dead', { score: this.score, ghosts: this.ghosts.length });
+    });
+  }
+
+  renderAll(time) {
+    // ── Background ───────────────────────────
+    const bg = this.gBG; bg.clear();
+    drawBackground(bg, this.stars, time);
+    // Subtle horizon ambience
+    bg.fillStyle(C.SURF, 0.022); bg.fillRect(0, TSY - 45, GW, 90);
+
+    // ── Track ────────────────────────────────
+    this.gTrack.clear();
+    drawTrack(this.gTrack);
+
+    // ── Ghosts ───────────────────────────────
+    const gg = this.gGhost; gg.clear();
+    this.ghosts.forEach((gWA, idx) => {
+      const sa = (gWA - Math.PI / 2) - this.worldAngle;
+      const gx = CX + TR * Math.cos(sa);
+      const gy = CY + TR * Math.sin(sa);
+      if (gy < TSY - 45 || gy > GH + 10) return;
+
+      const pulse = 0.50 + 0.38 * Math.sin(time * 0.004 + idx * 1.7);
+      const gR = PR + 2;
+      // Glow rings
+      gg.fillStyle(C.GH, 0.04 * pulse); gg.fillCircle(gx, gy - PR, gR + 16);
+      gg.fillStyle(C.GH, 0.09 * pulse); gg.fillCircle(gx, gy - PR, gR +  8);
+      gg.fillStyle(C.GH, 0.22 * pulse); gg.fillCircle(gx, gy - PR, gR +  3);
+      gg.fillStyle(C.GH, 0.50 * pulse); gg.fillCircle(gx, gy - PR, gR);
+      // Inner core
+      gg.fillStyle(0xAAEEFF, 0.28 * pulse); gg.fillCircle(gx - 3, gy - PR - 3, gR * 0.38);
+    });
+
+    // ── Obstacles ────────────────────────────
+    const obs = this.gObs; obs.clear();
+    OBS.forEach(([a, h, hw]) => {
+      const danger = Math.max(0, 1 - Math.abs(obsRel(a, this.worldAngle)) / 0.38);
+      drawSpike(obs, a, this.worldAngle, h, hw, danger);
+    });
+
+    // ── Player + Trail ───────────────────────
+    const pl = this.gPl; pl.clear();
+
+    // Trail particles (fade by age)
+    this.trail.forEach((pt, i) => {
+      const age = i / this.trail.length;
+      pl.fillStyle(C.TRAIL, age * 0.42);
+      pl.fillCircle(pt.x, pt.y, PR * 0.62 * age);
+    });
+
+    const px = CX, py = TSY - PR - this.jOff;
+    const airR = this.jOff > 4 ? PR + 1 : PR; // tiny inflate while airborne
+
+    if (this.alive) {
+      // Glow shells
+      pl.fillStyle(C.PL, 0.04); pl.fillCircle(px, py, airR + 20);
+      pl.fillStyle(C.PL, 0.10); pl.fillCircle(px, py, airR + 12);
+      pl.fillStyle(C.PL, 0.22); pl.fillCircle(px, py, airR +  6);
+      // Main orb
+      pl.fillStyle(C.PL, 1);    pl.fillCircle(px, py, airR);
+      // Specular
+      pl.fillStyle(C.PLCORE, 0.62); pl.fillCircle(px - 3.5, py - 3.5, airR * 0.42);
+      pl.fillStyle(C.PLCORE, 0.20); pl.fillCircle(px, py, airR * 0.68);
+    }
+
+    // ── Screen overlay (danger flash / death) ─
+    const over = this.gOver; over.clear();
+
+    if (this.alive) {
+      const obsClose = Math.min(...OBS.map(([a]) => Math.abs(obsRel(a, this.worldAngle))));
+      const ghClose  = this.ghosts.length
+        ? Math.min(...this.ghosts.map(gWA => Math.abs(ghostRel(gWA, this.worldAngle))))
+        : Infinity;
+      const closest  = Math.min(obsClose, ghClose);
+
+      if (closest < 0.28) {
+        const fa   = (1 - closest / 0.28) * 0.13;
+        const col  = ghClose < obsClose ? C.GH : C.OBE;
+        over.fillStyle(col, fa); over.fillRect(0, 0, GW, GH);
+      }
+    } else {
+      over.fillStyle(0x000000, 0.55); over.fillRect(0, 0, GW, GH);
+    }
+  }
+}
+
+// ════════════════════════════════════════════════════════════
+//  DEAD SCENE
+// ════════════════════════════════════════════════════════════
+class DeadScene extends Phaser.Scene {
+  constructor() { super('Dead'); }
+
+  create(data) {
+    const mono  = { fontFamily: '"Space Mono", monospace' };
+    const score = data?.score  || 0;
+    const ghCnt = data?.ghosts || 0;
+    const best  = parseInt(localStorage.getItem('er_best') || 0);
+    const isNew = score >= best && score > 0;
+
+    // Full dark background
+    const g = this.add.graphics();
+    g.fillStyle(C.BG, 1); g.fillRect(0, 0, GW, GH);
+    // Card
+    const cW = 440, cH = 340, cX = (GW - cW) / 2, cY = (GH - cH) / 2;
+    g.fillStyle(0x0A1E2E, 1);    g.fillRoundedRect(cX, cY, cW, cH, 20);
+    g.lineStyle(1.5, C.SURF, 0.22); g.strokeRoundedRect(cX, cY, cW, cH, 20);
+    // Accent top bar
+    g.fillStyle(C.SURF, 0.6);   g.fillRoundedRect(cX + 40, cY, cW - 80, 2, 1);
+
+    this.add.text(GW/2, cY + 30, 'GAME OVER', {
+      ...mono, fontSize: '24px', color: '#FF2244', letterSpacing: 6,
+    }).setOrigin(0.5);
+
+    this.add.text(GW/2, cY + 76, score.toString(), {
+      ...mono, fontSize: '72px', fontStyle: 'bold', color: '#FFFFFF',
+    }).setOrigin(0.5);
+
+    this.add.text(GW/2, cY + 148, 'DISTANCE', {
+      ...mono, fontSize: '11px', color: '#1E4A5A', letterSpacing: 4,
+    }).setOrigin(0.5);
+
+    if (isNew) {
+      const nb = this.add.text(GW/2, cY + 175, '✦  NEW BEST  ✦', {
+        ...mono, fontSize: '15px', color: '#FFE066', letterSpacing: 3,
+      }).setOrigin(0.5);
+      this.tweens.add({ targets: nb, alpha: 0.25, duration: 420, yoyo: true, repeat: -1 });
+    } else {
+      this.add.text(GW/2, cY + 175, `BEST  ${best}`, {
+        ...mono, fontSize: '15px', color: '#2A6070',
+      }).setOrigin(0.5);
+    }
+
+    this.add.text(GW/2, cY + 202, `GHOSTS SPAWNED: ${ghCnt}`, {
+      ...mono, fontSize: '12px', color: '#1A3A4A',
+    }).setOrigin(0.5);
+
+    // Retry button
+    const retry = this.add.text(GW/2, cY + 254, '[  RETRY  ]', {
+      ...mono, fontSize: '22px', color: '#00FFD1', letterSpacing: 2,
+    }).setOrigin(0.5).setInteractive({ cursor: 'pointer' });
+    retry.on('pointerover', () => retry.setColor('#FFFFFF'));
+    retry.on('pointerout',  () => retry.setColor('#00FFD1'));
+    retry.on('pointerup',   () => this.scene.start('Game'));
+
+    // Menu button
+    const menu = this.add.text(GW/2, cY + 298, '[  MENU  ]', {
+      ...mono, fontSize: '15px', color: '#2A5A6A', letterSpacing: 2,
+    }).setOrigin(0.5).setInteractive({ cursor: 'pointer' });
+    menu.on('pointerover', () => menu.setColor('#00FFD1'));
+    menu.on('pointerout',  () => menu.setColor('#2A5A6A'));
+    menu.on('pointerup',   () => this.scene.start('Menu'));
+
+    this.input.keyboard.on('keyup-SPACE', () => this.scene.start('Game'));
+    this.input.keyboard.on('keyup-ENTER', () => this.scene.start('Game'));
+  }
+}
+
+// ════════════════════════════════════════════════════════════
+//  PHASER CONFIG + INIT
+// ════════════════════════════════════════════════════════════
+const phaserConfig = {
+  type: Phaser.AUTO,
+  width: GW,
+  height: GH,
+  backgroundColor: '#060B14',
+  parent: 'game',
+  scale: { mode: Phaser.Scale.FIT, autoCenter: Phaser.Scale.CENTER_BOTH },
+  input: { activePointers: 4 },
+  scene: [BootScene, MenuScene, GameScene, DeadScene],
+};
+
+// Disable context menu (mobile long-press), handle tab visibility
+document.addEventListener('contextmenu', e => e.preventDefault());
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) SFX._ctx?.suspend();
+  else if (!SFX.muted) SFX._ctx?.resume();
+});
+
+new Phaser.Game(phaserConfig);
+</script>
+</body>
+</html>
