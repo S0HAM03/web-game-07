@@ -1,0 +1,13 @@
+node_modules/
+*.zip
+*.b64
+patch_*.js
+test_*.js
+debug*.js
+debug*.png
+verify*.png
+temp.js
+take_screenshot.js
+camera_search.txt
+script.js
+test.js
