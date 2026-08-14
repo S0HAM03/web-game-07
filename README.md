@@ -9,12 +9,13 @@ A feature-rich, high-performance **3D Endless Track Runner game** built using **
 - **🎮 3D Graphics Engine**: Built with Three.js, featuring dynamic lighting, post-processing unreal bloom, metallic humanoid player rig, and responsive camera controls.
 - **🎨 Skin & Theme Shop**: Integrated shop system with starting coin balance, unlockable player skins, and track color themes (Vaporwave, Cyberpunk, Synthwave, Neon).
 - **🔊 Web Audio API Sound Synthesizer**: Custom procedural sound synthesis for jumps, coin collections, shop purchases, and game events — zero external `.mp3` or `.wav` dependencies.
-- **📱 Full Mobile Support**:
+- **🏆 Leaderboard System**: Built-in score ranking system tracking high scores, total runs, and coin stats with LocalStorage support and dedicated modal UI.
+- **📱 Full Mobile & Desktop Control System**:
   - Glassmorphic on-screen touch control buttons (`▲ IN` / `▼ OUT`).
   - Split-screen side-tap steering (Left = Out, Right = In).
   - Intuitive vertical swipe gestures (Swipe Up = In, Swipe Down = Out).
-  - Responsive 2-column mobile layout.
-- **🖱️ Smart Input Separation**: Desktop mouse cursor is dedicated to UI interactions (Mute sound, Main Menu, Shop, Restart) without interfering with player movement controls.
+  - Responsive 2-column mobile & landscape modal layout with top-right `✕` close buttons.
+- **🖱️ Smart Input Separation**: Desktop mouse cursor is dedicated to UI interactions (Mute sound, Main Menu, Shop, Leaderboard, Restart) without interfering with player movement controls.
 - **⚡ CrazyGames SDK v3 Ready**: Pre-integrated for web game portals and ad networks.
 
 ---
