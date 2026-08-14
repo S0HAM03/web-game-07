@@ -59,3 +59,10 @@ No node modules, local server setup, or compilation needed.
 
 - **`index.html`**: The complete single-file standalone web game containing all logic, rendering, styles, audio generators, and embedded textures.
 - **`README.md`**: Project documentation and usage guide.
+- **`LICENSE`**: MIT License copyright file.
+
+---
+
+## 📜 License
+
+This project is licensed under the [MIT License](file:///d:/Web-Projects/Web-game-06/LICENSE) - Copyright (c) 2026 **S0HAM03**.
