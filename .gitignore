@@ -13,3 +13,9 @@ take_screenshot.js
 camera_search.txt
 script.js
 test.js
+search_*.js
+check_*.js
+run_*.js
+package*.json
+
+
